@@ -3,6 +3,7 @@ pub mod cpu;
 pub mod dram;
 pub mod exception;
 pub mod param;
+pub mod csr;
 
 use cpu::Cpu;
 use std::io::Read;
