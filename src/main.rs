@@ -1,9 +1,9 @@
 pub mod bus;
 pub mod cpu;
+pub mod csr;
 pub mod dram;
 pub mod exception;
 pub mod param;
-pub mod csr;
 
 use cpu::Cpu;
 use std::io::Read;
@@ -25,8 +25,12 @@ fn main() -> io::Result<()> {
         let inst = match cpu.fetch() {
             Ok(inst) => inst,
             Err(e) => {
-                println!("{}", e);
-                break;
+                cpu.handle_exception(e);
+                if e.is_fatal() {
+                    println!("{}", e);
+                    break;
+                }
+                continue;
             }
         };
 
@@ -35,8 +39,11 @@ fn main() -> io::Result<()> {
         match cpu.execute(inst) {
             Ok(n_pc) => cpu.set_pc(n_pc),
             Err(e) => {
-                println!("{}", e);
-                break;
+                cpu.handle_exception(e);
+                if e.is_fatal() {
+                    println!("{}", e);
+                    break;
+                }
             }
         }
     }

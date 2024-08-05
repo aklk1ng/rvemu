@@ -60,6 +60,73 @@ impl Cpu {
         self.bus.store(addr, size, value)
     }
 
+    /// 1. update hart's privilege mode (M or S according to current mode and exception setting).
+    /// 2. save current pc in epc (sepc in S-mode, mepc in M-mode)
+    /// 3. set pc to trap vector (stvec in S-mode, mtvec in M-mode)
+    /// 4. set cause register with exception code (scause in S-mode, mcause in M-mode)
+    /// 5. set trap value properly (stval in S-mode, mtval in M-mode)
+    /// 6. set xPIE to xIE (SPIE in S-mode, MPIE in M-mode)
+    /// 7. clear up xIE (SIE in S-mode, MIE in M-mode)
+    /// 8. set xPP to previous mode.
+    pub fn handle_exception(&mut self, e: Exception) {
+        let pc = self.pc;
+        let mode = self.mode;
+        let cause = e.code();
+        // if an exception happen in U-mode or S-mode, and the exception is delegated to S-mode.
+        // then this exception should be handled in S-mode.
+        let trap_in_s_mode = mode <= Supervisor && self.csr.is_medelegated(cause);
+        let (STATUS, TVEC, CAUSE, TVAL, EPC, MASK_PIE, pie_i, MASK_IE, ie_i, MASK_PP, pp_i) =
+            if trap_in_s_mode {
+                self.mode = Supervisor;
+                (
+                    SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8,
+                )
+            } else {
+                self.mode = Machine;
+                (
+                    MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11,
+                )
+            };
+        // 2
+        // 3.1.7 & 4.1.2
+        // The BASE field in tvec is a WARL field that can hold any valid virtual or physical address,
+        // subject to the following alignment constraints: the address must be 4-byte aligned
+        self.pc = self.csr.load(TVEC) & !0b11;
+        // 3
+        // 3.1.14 & 4.1.7
+        // When a trap is taken into S-mode (or M-mode), sepc (or mepc) is written with the virtual address
+        // of the instruction that was interrupted or that encountered the exception.
+        self.csr.store(EPC, pc);
+        // 4
+        // 3.1.15 & 4.1.8
+        // When a trap is taken into S-mode (or M-mode), scause (or mcause) is written with a code indicating
+        // the event that caused the trap.
+        self.csr.store(CAUSE, cause);
+        // 5
+        // 3.1.16 & 4.1.9
+        // If stval is written with a nonzero value when a breakpoint, address-misaligned, access-fault, or
+        // page-fault exception occurs on an instruction fetch, load, or store, then stval will contain the
+        // faulting virtual address.
+        // If stval is written with a nonzero value when a misaligned load or store causes an access-fault or
+        // page-fault exception, then stval will contain the virtual address of the portion of the access that
+        // caused the fault
+        self.csr.store(TVAL, e.value());
+        // 6
+        // 3.1.6 covers both sstatus and mstatus.
+        let mut status = self.csr.load(STATUS);
+        // get SIE or MIE
+        let ie = (status & MASK_IE) >> ie_i;
+        // set SPIE = SIE / MPIE = MIE
+        status = (status & !MASK_PIE) | (ie << pie_i);
+        // 7
+        // set SIE = 0 / MIE = 0
+        status &= !MASK_IE;
+        // 8
+        // set SPP / MPP = previous mode
+        status = (status & !MASK_PP) | (mode << pp_i);
+        self.csr.store(STATUS, status);
+    }
+
     /// Check all registers value
     pub fn reg(&self, r: &str) -> u64 {
         match RABI.iter().position(|&x| x == r) {
