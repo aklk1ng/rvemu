@@ -1,34 +1,40 @@
-use crate::bus::Bus;
+//! The cpu module contains `Cpu` and implementarion for it.
+
+use crate::bus::*;
 use crate::csr::*;
-use crate::exception::Exception;
-use crate::param::{DRAM_BASE, DRAM_END};
+use crate::exception::*;
+use crate::param::*;
 
-const RABI: [&str; 32] = [
-    "zero", " ra ", " sp ", " gp ", " tp ", " t0 ", " t1 ", " t2 ", " s0 ", " s1 ", " a0 ", " a1 ",
-    " a2 ", " a3 ", " a4 ", " a5 ", " a6 ", " a7 ", " s2 ", " s3 ", " s4 ", " s5 ", " s6 ", " s7 ",
-    " s8 ", " s9 ", " s10", " s11", " t3 ", " t4 ", " t5 ", " t6 ",
-];
-
+// Riscv Privilege Mode
 type Mode = u64;
 const User: Mode = 0b00;
 const Supervisor: Mode = 0b01;
 const Machine: Mode = 0b11;
 
+/// The `Cpu` struct that contains registers, a program coutner, system bus that connects
+/// peripheral devices, and control and status registers.
 pub struct Cpu {
-    /// 32 64-bit registers
-    regs: [u64; 32],
-    /// Program counter
-    pc: u64,
-    /// Computer dram to store executable instructions
-    bus: Bus,
-    /// control and status registers
-    csr: Csr,
-    /// Current privilege mode
-    mode: Mode,
+    /// 32 64-bit integer registers.
+    pub regs: [u64; 32],
+    /// Program counter to hold the the dram address of the next instruction that would be executed.
+    pub pc: u64,
+    /// The current privilege mode.
+    pub mode: Mode,
+    /// System bus that transfers data between CPU and peripheral devices.
+    pub bus: Bus,
+    /// Control and status registers. RISC-V ISA sets aside a 12-bit encoding space (csr[11:0]) for
+    /// up to 4096 CSRs.
+    pub csr: Csr,
 }
 
+const RVABI: [&str; 32] = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+    "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+    "t5", "t6",
+];
+
 impl Cpu {
-    /// Create a new new CPU with code
+    /// Create a new `Cpu` object.
     pub fn new(code: Vec<u8>) -> Self {
         let mut regs = [0; 32];
         regs[2] = DRAM_END;
@@ -46,90 +52,8 @@ impl Cpu {
         }
     }
 
-    pub fn set_pc(&mut self, pc: u64) {
-        self.pc = pc;
-    }
-
-    /// Load a value from dram
-    pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
-        self.bus.load(addr, size)
-    }
-
-    /// Store a value to dram
-    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
-        self.bus.store(addr, size, value)
-    }
-
-    /// 1. update hart's privilege mode (M or S according to current mode and exception setting).
-    /// 2. save current pc in epc (sepc in S-mode, mepc in M-mode)
-    /// 3. set pc to trap vector (stvec in S-mode, mtvec in M-mode)
-    /// 4. set cause register with exception code (scause in S-mode, mcause in M-mode)
-    /// 5. set trap value properly (stval in S-mode, mtval in M-mode)
-    /// 6. set xPIE to xIE (SPIE in S-mode, MPIE in M-mode)
-    /// 7. clear up xIE (SIE in S-mode, MIE in M-mode)
-    /// 8. set xPP to previous mode.
-    pub fn handle_exception(&mut self, e: Exception) {
-        let pc = self.pc;
-        let mode = self.mode;
-        let cause = e.code();
-        // if an exception happen in U-mode or S-mode, and the exception is delegated to S-mode.
-        // then this exception should be handled in S-mode.
-        let trap_in_s_mode = mode <= Supervisor && self.csr.is_medelegated(cause);
-        let (STATUS, TVEC, CAUSE, TVAL, EPC, MASK_PIE, pie_i, MASK_IE, ie_i, MASK_PP, pp_i) =
-            if trap_in_s_mode {
-                self.mode = Supervisor;
-                (
-                    SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8,
-                )
-            } else {
-                self.mode = Machine;
-                (
-                    MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11,
-                )
-            };
-        // 2
-        // 3.1.7 & 4.1.2
-        // The BASE field in tvec is a WARL field that can hold any valid virtual or physical address,
-        // subject to the following alignment constraints: the address must be 4-byte aligned
-        self.pc = self.csr.load(TVEC) & !0b11;
-        // 3
-        // 3.1.14 & 4.1.7
-        // When a trap is taken into S-mode (or M-mode), sepc (or mepc) is written with the virtual address
-        // of the instruction that was interrupted or that encountered the exception.
-        self.csr.store(EPC, pc);
-        // 4
-        // 3.1.15 & 4.1.8
-        // When a trap is taken into S-mode (or M-mode), scause (or mcause) is written with a code indicating
-        // the event that caused the trap.
-        self.csr.store(CAUSE, cause);
-        // 5
-        // 3.1.16 & 4.1.9
-        // If stval is written with a nonzero value when a breakpoint, address-misaligned, access-fault, or
-        // page-fault exception occurs on an instruction fetch, load, or store, then stval will contain the
-        // faulting virtual address.
-        // If stval is written with a nonzero value when a misaligned load or store causes an access-fault or
-        // page-fault exception, then stval will contain the virtual address of the portion of the access that
-        // caused the fault
-        self.csr.store(TVAL, e.value());
-        // 6
-        // 3.1.6 covers both sstatus and mstatus.
-        let mut status = self.csr.load(STATUS);
-        // get SIE or MIE
-        let ie = (status & MASK_IE) >> ie_i;
-        // set SPIE = SIE / MPIE = MIE
-        status = (status & !MASK_PIE) | (ie << pie_i);
-        // 7
-        // set SIE = 0 / MIE = 0
-        status &= !MASK_IE;
-        // 8
-        // set SPP / MPP = previous mode
-        status = (status & !MASK_PP) | (mode << pp_i);
-        self.csr.store(STATUS, status);
-    }
-
-    /// Check all registers value
     pub fn reg(&self, r: &str) -> u64 {
-        match RABI.iter().position(|&x| x == r) {
+        match RVABI.iter().position(|&x| x == r) {
             Some(i) => self.regs[i],
             None => match r {
                 "pc" => self.pc,
@@ -166,47 +90,125 @@ impl Cpu {
         }
     }
 
-    pub fn dump_ccsr(&self) {
-        self.csr.dump_csrs();
+    pub fn dump_pc(&self) {
+        println!("{:-^80}", "PC register");
+        println!("PC = {:#x}\n", self.pc);
     }
 
-    /// Print values in all registers (x0-x31).
-    pub fn dump_registers(&self) {
+    pub fn dump_registers(&mut self) {
         println!("{:-^80}", "registers");
-        let mut output = String::from("");
+        let mut output = String::new();
+        self.regs[0] = 0;
+
         for i in (0..32).step_by(4) {
-            output = format!(
-                "{}\n{}",
-                output,
-                format!(
-                    "x{:02}({})={:>#10x} x{:02}({})={:>#10x} x{:02}({})={:>#10x} x{:02}({})={:>#10x}",
-                    i, RABI[i], self.regs[i],
-                    i + 1, RABI[i + 1], self.regs[i + 1],
-                    i + 2, RABI[i + 2], self.regs[i + 2],
-                    i + 3, RABI[i + 3], self.regs[i + 3],
-                )
+            let i0 = format!("x{}", i);
+            let i1 = format!("x{}", i + 1);
+            let i2 = format!("x{}", i + 2);
+            let i3 = format!("x{}", i + 3);
+            let line = format!(
+                "{:3}({:^4}) = {:<#18x} {:3}({:^4}) = {:<#18x} {:3}({:^4}) = {:<#18x} {:3}({:^4}) = {:<#18x}\n",
+                i0, RVABI[i], self.regs[i],
+                i1, RVABI[i + 1], self.regs[i + 1],
+                i2, RVABI[i + 2], self.regs[i + 2],
+                i3, RVABI[i + 3], self.regs[i + 3],
             );
+            output = output + &line;
         }
+
         println!("{}", output);
     }
 
-    /// Return the pc value
-    pub fn get_pc(&self) -> u64 {
-        self.pc
+    /// Print values in some csrs.
+    pub fn dump_csrs(&self) {
+        self.csr.dump_csrs();
     }
 
-    /// Return the next instruction
-    #[inline]
-    pub fn step(&mut self) -> Result<u64, Exception> {
-        Ok(self.pc + 4)
+    pub fn handle_exception(&mut self, e: Exception) {
+        // the process to handle exception in S-mode and M-mode is similar,
+        // includes following steps:
+        // 0. set xPP to current mode.
+        // 1. update hart's privilege mode (M or S according to current mode and exception setting).
+        // 2. save current pc in epc (sepc in S-mode, mepc in M-mode)
+        // 3. set pc to trap vector (stvec in S-mode, mtvec in M-mode)
+        // 4. set cause to exception code (scause in S-mode, mcause in M-mode)
+        // 5. set trap value properly (stval in S-mode, mtval in M-mode)
+        // 6. set xPIE to xIE (SPIE in S-mode, MPIE in M-mode)
+        // 7. clear up xIE (SIE in S-mode, MIE in M-mode)
+        let pc = self.pc;
+        let mode = self.mode;
+        let cause = e.code();
+        // if an exception happen in U-mode or S-mode, and the exception is delegated to S-mode.
+        // then this exception should be handled in S-mode.
+        let trap_in_s_mode = mode <= Supervisor && self.csr.is_medelegated(cause);
+        let (STATUS, TVEC, CAUSE, TVAL, EPC, MASK_PIE, pie_i, MASK_IE, ie_i, MASK_PP, pp_i) =
+            if trap_in_s_mode {
+                self.mode = Supervisor;
+                (
+                    SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8,
+                )
+            } else {
+                self.mode = Machine;
+                (
+                    MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11,
+                )
+            };
+        // 3.1.7 & 4.1.2
+        // The BASE field in tvec is a WARL field that can hold any valid virtual or physical address,
+        // subject to the following alignment constraints: the address must be 4-byte aligned
+        self.pc = self.csr.load(TVEC) & !0b11;
+        // 3.1.14 & 4.1.7
+        // When a trap is taken into S-mode (or M-mode), sepc (or mepc) is written with the virtual address
+        // of the instruction that was interrupted or that encountered the exception.
+        self.csr.store(EPC, pc);
+        // 3.1.15 & 4.1.8
+        // When a trap is taken into S-mode (or M-mode), scause (or mcause) is written with a code indicating
+        // the event that caused the trap.
+        self.csr.store(CAUSE, cause);
+        // 3.1.16 & 4.1.9
+        // If stval is written with a nonzero value when a breakpoint, address-misaligned, access-fault, or
+        // page-fault exception occurs on an instruction fetch, load, or store, then stval will contain the
+        // faulting virtual address.
+        // If stval is written with a nonzero value when a misaligned load or store causes an access-fault or
+        // page-fault exception, then stval will contain the virtual address of the portion of the access that
+        // caused the fault
+        self.csr.store(TVAL, e.value());
+        // 3.1.6 covers both sstatus and mstatus.
+        let mut status = self.csr.load(STATUS);
+        // get SIE or MIE
+        let ie = (status & MASK_IE) >> ie_i;
+        // set SPIE = SIE / MPIE = MIE
+        status = (status & !MASK_PIE) | (ie << pie_i);
+        // set SIE = 0 / MIE = 0
+        status &= !MASK_IE;
+        // set SPP / MPP = previous mode
+        status = (status & !MASK_PP) | (mode << pp_i);
+        self.csr.store(STATUS, status);
     }
 
-    /// Fetch the next instruction in little-endian format
+    /// Load a value from a dram.
+    pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
+        self.bus.load(addr, size)
+    }
+
+    /// Store a value to a dram.
+    pub fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Exception> {
+        self.bus.store(addr, size, value)
+    }
+
+    /// Get an instruction from the dram.
     pub fn fetch(&mut self) -> Result<u64, Exception> {
-        self.bus.load(self.pc, 32)
+        match self.bus.load(self.pc, 32) {
+            Ok(inst) => Ok(inst),
+            Err(_e) => Err(Exception::InstructionAccessFault(self.pc)),
+        }
     }
 
-    /// Execute an instruction
+    #[inline]
+    pub fn update_pc(&mut self) -> Result<u64, Exception> {
+        return Ok(self.pc + 4);
+    }
+
+    /// Execute an instruction after decoding. Return true if an error happens, otherwise false.
     pub fn execute(&mut self, inst: u64) -> Result<u64, Exception> {
         let opcode = inst & 0x0000007f;
         let rd = ((inst & 0x00000f80) >> 7) as usize;
@@ -228,43 +230,54 @@ impl Cpu {
                         // lb
                         let val = self.load(addr, 8)?;
                         self.regs[rd] = val as i8 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x1 => {
                         // lh
                         let val = self.load(addr, 16)?;
                         self.regs[rd] = val as i16 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x2 => {
                         // lw
                         let val = self.load(addr, 32)?;
                         self.regs[rd] = val as i32 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x3 => {
                         // ld
                         let val = self.load(addr, 64)?;
                         self.regs[rd] = val;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x4 => {
                         // lbu
                         let val = self.load(addr, 8)?;
                         self.regs[rd] = val;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x5 => {
                         // lhu
                         let val = self.load(addr, 16)?;
                         self.regs[rd] = val;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x6 => {
                         // lwu
                         let val = self.load(addr, 32)?;
                         self.regs[rd] = val;
-                        return self.step();
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(inst)),
+                }
+            }
+            0x0f => {
+                // A fence instruction does nothing because this emulator executes an
+                // instruction sequentially on a single thread.
+                match funct3 {
+                    0x0 => {
+                        // fence
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -278,12 +291,12 @@ impl Cpu {
                     0x0 => {
                         // addi
                         self.regs[rd] = self.regs[rs1].wrapping_add(imm);
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x1 => {
                         // slli
                         self.regs[rd] = self.regs[rs1] << shamt;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x2 => {
                         // slti
@@ -292,40 +305,40 @@ impl Cpu {
                         } else {
                             0
                         };
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x3 => {
                         // sltiu
                         self.regs[rd] = if self.regs[rs1] < imm { 1 } else { 0 };
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x4 => {
                         // xori
                         self.regs[rd] = self.regs[rs1] ^ imm;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x5 => {
                         match funct7 >> 1 {
                             // srli
                             0x00 => {
                                 self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
-                                return self.step();
+                                return self.update_pc();
                             }
                             // srai
                             0x10 => {
                                 self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
-                                return self.step();
+                                return self.update_pc();
                             }
                             _ => Err(Exception::IllegalInstruction(inst)),
                         }
                     }
                     0x6 => {
                         self.regs[rd] = self.regs[rs1] | imm;
-                        return self.step();
+                        return self.update_pc();
                     } // ori
                     0x7 => {
                         self.regs[rd] = self.regs[rs1] & imm; // andi
-                        return self.step();
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -334,7 +347,7 @@ impl Cpu {
                 // auipc
                 let imm = (inst & 0xfffff000) as i32 as i64 as u64;
                 self.regs[rd] = self.pc.wrapping_add(imm);
-                return self.step();
+                return self.update_pc();
             }
             0x1b => {
                 let imm = ((inst as i32 as i64) >> 20) as u64;
@@ -344,12 +357,12 @@ impl Cpu {
                     0x0 => {
                         // addiw
                         self.regs[rd] = self.regs[rs1].wrapping_add(imm) as i32 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x1 => {
                         // slliw
                         self.regs[rd] = self.regs[rs1].wrapping_shl(shamt) as i32 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x5 => {
                         match funct7 {
@@ -357,13 +370,13 @@ impl Cpu {
                                 // srliw
                                 self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32
                                     as i64 as u64;
-                                return self.step();
+                                return self.update_pc();
                             }
                             0x20 => {
                                 // sraiw
                                 self.regs[rd] =
                                     (self.regs[rs1] as i32).wrapping_shr(shamt) as i64 as u64;
-                                return self.step();
+                                return self.update_pc();
                             }
                             _ => Err(Exception::IllegalInstruction(inst)),
                         }
@@ -378,21 +391,58 @@ impl Cpu {
                 match funct3 {
                     0x0 => {
                         self.store(addr, 8, self.regs[rs2])?;
-                        self.step()
+                        self.update_pc()
                     } // sb
                     0x1 => {
                         self.store(addr, 16, self.regs[rs2])?;
-                        self.step()
+                        self.update_pc()
                     } // sh
                     0x2 => {
                         self.store(addr, 32, self.regs[rs2])?;
-                        self.step()
+                        self.update_pc()
                     } // sw
                     0x3 => {
                         self.store(addr, 64, self.regs[rs2])?;
-                        self.step()
+                        self.update_pc()
                     } // sd
                     _ => unreachable!(),
+                }
+            }
+            0x2f => {
+                // RV64A: "A" standard extension for atomic instructions
+                let funct5 = (funct7 & 0b1111100) >> 2;
+                let _aq = (funct7 & 0b0000010) >> 1; // acquire access
+                let _rl = funct7 & 0b0000001; // release access
+                match (funct3, funct5) {
+                    (0x2, 0x00) => {
+                        // amoadd.w
+                        let t = self.load(self.regs[rs1], 32)?;
+                        self.store(self.regs[rs1], 32, t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x3, 0x00) => {
+                        // amoadd.d
+                        let t = self.load(self.regs[rs1], 64)?;
+                        self.store(self.regs[rs1], 64, t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x2, 0x01) => {
+                        // amoswap.w
+                        let t = self.load(self.regs[rs1], 32)?;
+                        self.store(self.regs[rs1], 32, self.regs[rs2])?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x3, 0x01) => {
+                        // amoswap.d
+                        let t = self.load(self.regs[rs1], 64)?;
+                        self.store(self.regs[rs1], 64, self.regs[rs2])?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(inst)),
                 }
             }
             0x33 => {
@@ -404,22 +454,22 @@ impl Cpu {
                     (0x0, 0x00) => {
                         // add
                         self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x0, 0x01) => {
                         // mul
                         self.regs[rd] = self.regs[rs1].wrapping_mul(self.regs[rs2]);
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x0, 0x20) => {
                         // sub
                         self.regs[rd] = self.regs[rs1].wrapping_sub(self.regs[rs2]);
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x1, 0x00) => {
                         // sll
                         self.regs[rd] = self.regs[rs1].wrapping_shl(shamt);
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x2, 0x00) => {
                         // slt
@@ -428,7 +478,7 @@ impl Cpu {
                         } else {
                             0
                         };
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x3, 0x00) => {
                         // sltu
@@ -437,32 +487,32 @@ impl Cpu {
                         } else {
                             0
                         };
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x4, 0x00) => {
                         // xor
                         self.regs[rd] = self.regs[rs1] ^ self.regs[rs2];
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x5, 0x00) => {
                         // srl
                         self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x5, 0x20) => {
                         // sra
                         self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x6, 0x00) => {
                         // or
                         self.regs[rd] = self.regs[rs1] | self.regs[rs2];
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x7, 0x00) => {
                         // and
                         self.regs[rd] = self.regs[rs1] & self.regs[rs2];
-                        return self.step();
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -470,7 +520,7 @@ impl Cpu {
             0x37 => {
                 // lui
                 self.regs[rd] = (inst & 0xfffff000) as i32 as i64 as u64;
-                return self.step();
+                return self.update_pc();
             }
             0x3b => {
                 // "The shift amount is given by rs2[4:0]."
@@ -480,28 +530,52 @@ impl Cpu {
                         // addw
                         self.regs[rd] =
                             self.regs[rs1].wrapping_add(self.regs[rs2]) as i32 as i64 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x0, 0x20) => {
                         // subw
                         self.regs[rd] =
                             ((self.regs[rs1].wrapping_sub(self.regs[rs2])) as i32) as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x1, 0x00) => {
                         // sllw
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shl(shamt) as i32 as u64;
-                        return self.step();
+                        return self.update_pc();
                     }
                     (0x5, 0x00) => {
                         // srlw
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
-                        return self.step();
+                        return self.update_pc();
+                    }
+                    (0x5, 0x01) => {
+                        // divu
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => 0xffffffff_ffffffff,
+                            _ => {
+                                let dividend = self.regs[rs1];
+                                let divisor = self.regs[rs2];
+                                dividend.wrapping_div(divisor)
+                            }
+                        };
+                        return self.update_pc();
                     }
                     (0x5, 0x20) => {
                         // sraw
                         self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
-                        return self.step();
+                        return self.update_pc();
+                    }
+                    (0x7, 0x01) => {
+                        // remuw
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => self.regs[rs1],
+                            _ => {
+                                let dividend = self.regs[rs1] as u32;
+                                let divisor = self.regs[rs2] as u32;
+                                dividend.wrapping_rem(divisor) as i32 as u64
+                            }
+                        };
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -519,42 +593,42 @@ impl Cpu {
                         if self.regs[rs1] == self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x1 => {
                         // bne
                         if self.regs[rs1] != self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x4 => {
                         // blt
                         if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x5 => {
                         // bge
                         if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x6 => {
                         // bltu
                         if self.regs[rs1] < self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x7 => {
                         // bgeu
                         if self.regs[rs1] >= self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
-                        return self.step();
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -586,6 +660,23 @@ impl Cpu {
                 match funct3 {
                     0x0 => {
                         match (rs2, funct7) {
+                            // ECALL and EBREAK cause the receiving privilege mode’s epc register to be set to the address of
+                            // the ECALL or EBREAK instruction itself, not the address of the following instruction.
+                            (0x0, 0x0) => {
+                                // ecall
+                                // Makes a request of the execution environment by raising an environment call exception.
+                                match self.mode {
+                                    User => Err(Exception::EnvironmentCallFromUMode(self.pc)),
+                                    Supervisor => Err(Exception::EnvironmentCallFromSMode(self.pc)),
+                                    Machine => Err(Exception::EnvironmentCallFromMMode(self.pc)),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            (0x1, 0x0) => {
+                                // ebreak
+                                // Makes a request of the debugger bu raising a Breakpoint exception.
+                                return Err(Exception::Breakpoint(self.pc));
+                            }
                             (0x2, 0x8) => {
                                 // sret
                                 // When the SRET instruction is executed to return from the trap
@@ -632,7 +723,7 @@ impl Cpu {
                             (_, 0x9) => {
                                 // sfence.vma
                                 // Do nothing.
-                                return self.step();
+                                return self.update_pc();
                             }
                             _ => Err(Exception::IllegalInstruction(inst)),
                         }
@@ -642,28 +733,28 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, self.regs[rs1]);
                         self.regs[rd] = t;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x2 => {
                         // csrrs
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t | self.regs[rs1]);
                         self.regs[rd] = t;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x3 => {
                         // csrrc
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t & (!self.regs[rs1]));
                         self.regs[rd] = t;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x5 => {
                         // csrrwi
                         let zimm = rs1 as u64;
                         self.regs[rd] = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, zimm);
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x6 => {
                         // csrrsi
@@ -671,7 +762,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t | zimm);
                         self.regs[rd] = t;
-                        return self.step();
+                        return self.update_pc();
                     }
                     0x7 => {
                         // csrrci
@@ -679,7 +770,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t & (!zimm));
                         self.regs[rd] = t;
-                        return self.step();
+                        return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
                 }
@@ -695,17 +786,6 @@ mod test {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::process::Command;
-
-    macro_rules! riscv_test {
-        ( $code:expr, $name:expr, $clock:expr, $($real:expr => $expect:expr),* ) => {
-            match rv_helper($code, $name, $clock) {
-                Ok(cpu) => {
-                    $(assert_eq!(cpu.reg($real), $expect);)*
-                }
-                Err(e) => { println!("error: {}", e); assert!(false); }
-            }
-        };
-    }
 
     fn generate_rv_assembly(c_src: &str) {
         let cc = "clang";
@@ -751,6 +831,7 @@ mod test {
             .expect("Failed to generate rv binary");
         println!("{}", String::from_utf8_lossy(&output.stderr));
     }
+
     fn rv_helper(code: &str, testname: &str, n_clock: usize) -> Result<Cpu, std::io::Error> {
         let filename = testname.to_owned() + ".s";
         let mut file = File::create(&filename)?;
@@ -776,10 +857,212 @@ mod test {
         return Ok(cpu);
     }
 
+    macro_rules! riscv_test {
+        ( $code:expr, $name:expr, $clock:expr, $($real:expr => $expect:expr),* ) => {
+            match rv_helper($code, $name, $clock) {
+                Ok(cpu) => {
+                    $(assert_eq!(cpu.reg($real), $expect);)*
+                }
+                Err(e) => { println!("error: {}", e); assert!(false); }
+            }
+        };
+    }
+
     #[test]
     fn test_addi() {
         let code = "addi x31, x0, 42";
         riscv_test!(code, "test_addi", 1, "x31" => 42);
+    }
+
+    #[test]
+    fn test_simple() {
+        // this is the assembly code of simple.c
+        let code = "
+            addi	sp,sp,-16
+            sd	s0,8(sp)
+            addi	s0,sp,16
+            li	a5,42
+            mv	a0,a5
+            ld	s0,8(sp)
+            addi	sp,sp,16
+            jr	ra
+        ";
+        riscv_test!(code, "test_simple", 20, "a0" => 42);
+    }
+
+    #[test]
+    fn test_lui() {
+        let code = "lui a0, 42";
+        riscv_test!(code, "test_lui", 1, "a0" => 42 << 12);
+    }
+
+    #[test]
+    fn test_auipc() {
+        let code = "auipc a0, 42";
+        riscv_test!(code, "test_auipc", 1, "a0" => DRAM_BASE + (42 << 12));
+    }
+
+    #[test]
+    fn test_jal() {
+        let code = "jal a0, 42";
+        riscv_test!(code, "test_jal", 1, "a0" => DRAM_BASE + 4, "pc" => DRAM_BASE + 42);
+    }
+
+    #[test]
+    fn test_jalr() {
+        let code = "
+            addi a1, zero, 42
+            jalr a0, -8(a1)
+        ";
+        riscv_test!(code, "test_jalr", 2, "a0" => DRAM_BASE + 8, "pc" => 34);
+    }
+
+    #[test]
+    fn test_beq() {
+        let code = "
+            beq  x0, x0, 42
+        ";
+        riscv_test!(code, "test_beq", 3, "pc" => DRAM_BASE + 42);
+    }
+
+    #[test]
+    fn test_bne() {
+        let code = "
+            addi x1, x0, 10
+            bne  x0, x1, 42
+        ";
+        riscv_test!(code, "test_bne", 5, "pc" => DRAM_BASE + 42 + 4);
+    }
+
+    #[test]
+    fn test_blt() {
+        let code = "
+            addi x1, x0, 10
+            addi x2, x0, 20
+            blt  x1, x2, 42
+        ";
+        riscv_test!(code, "test_blt", 10, "pc" => DRAM_BASE + 42 + 8);
+    }
+
+    #[test]
+    fn test_bge() {
+        let code = "
+            addi x1, x0, 10
+            addi x2, x0, 20
+            bge  x2, x1, 42
+        ";
+        riscv_test!(code, "test_bge", 10, "pc" => DRAM_BASE + 42 + 8);
+    }
+
+    #[test]
+    fn test_bltu() {
+        let code = "
+            addi x1, x0, 10
+            addi x2, x0, 20
+            bltu x1, x2, 42
+        ";
+        riscv_test!(code, "test_bltu", 10, "pc" => DRAM_BASE + 42 + 8);
+    }
+
+    #[test]
+    fn test_bgeu() {
+        let code = "
+            addi x1, x0, 10
+            addi x2, x0, 20
+            bgeu x2, x1, 42
+        ";
+        riscv_test!(code, "test_bgeu", 10, "pc" => DRAM_BASE + 42 + 8);
+    }
+
+    #[test]
+    fn test_store_load1() {
+        let code = "
+            addi s0, zero, 256
+            addi sp, sp, -16
+            sd   s0, 8(sp)
+            lb   t1, 8(sp)
+            lh   t2, 8(sp)
+        ";
+        riscv_test!(code, "test_store_load1", 10, "t1" => 0, "t2" => 256);
+    }
+
+    #[test]
+    fn test_slt() {
+        let code = "
+            addi t0, zero, 14
+            addi t1, zero, 24
+            slt  t2, t0, t1
+            slti t3, t0, 42
+            sltiu t4, t0, 84
+        ";
+        riscv_test!(code, "test_slt", 7, "t2" => 1, "t3" => 1, "t4" => 1);
+    }
+
+    #[test]
+    fn test_xor() {
+        let code = "
+            addi a0, zero, 0b10
+            xori a1, a0, 0b01
+            xor a2, a1, a1
+        ";
+        riscv_test!(code, "test_xor", 5, "a1" => 3, "a2" => 0);
+    }
+
+    #[test]
+    fn test_or() {
+        let code = "
+            addi a0, zero, 0b10
+            ori  a1, a0, 0b01
+            or   a2, a0, a0
+        ";
+        riscv_test!(code, "test_or", 3, "a1" => 0b11, "a2" => 0b10);
+    }
+
+    #[test]
+    fn test_and() {
+        let code = "
+            addi a0, zero, 0b10
+            andi a1, a0, 0b11
+            and  a2, a0, a1
+        ";
+        riscv_test!(code, "test_and", 3, "a1" => 0b10, "a2" => 0b10);
+    }
+
+    #[test]
+    fn test_sll() {
+        let code = "
+            addi a0, zero, 1
+            addi a1, zero, 5
+            sll  a2, a0, a1
+            slli a3, a0, 5
+            addi s0, zero, 64
+            sll  a4, a0, s0
+        ";
+        riscv_test!(code, "test_sll", 10, "a2" => 1 << 5, "a3" => 1 << 5, "a4" => 1);
+    }
+
+    #[test]
+    fn test_sra_srl() {
+        let code = "
+            addi a0, zero, -8
+            addi a1, zero, 1
+            sra  a2, a0, a1
+            srai a3, a0, 2
+            srli a4, a0, 2
+            srl  a5, a0, a1
+        ";
+        riscv_test!(code, "test_sra_srl", 10, "a2" => -4 as i64 as u64, "a3" => -2 as i64 as u64,
+                                              "a4" => -8 as i64 as u64 >> 2, "a5" => -8 as i64 as u64 >> 1);
+    }
+
+    #[test]
+    fn test_word_op() {
+        let code = "
+            addi a0, zero, 42
+            lui  a1, 0x7f000
+            addw a2, a0, a1
+        ";
+        riscv_test!(code, "test_word_op", 29, "a2" => 0x7f00002a);
     }
 
     #[test]
@@ -799,5 +1082,56 @@ mod test {
         ";
         riscv_test!(code, "test_csrs1", 20, "mstatus" => 1, "mtvec" => 2, "mepc" => 3,
                                             "sstatus" => 0, "stvec" => 5, "sepc" => 6);
+    }
+
+    #[test]
+    fn compile_hello_world() {
+        // You should run it by
+        // -- cargo run helloworld.bin
+        let c_code = r"
+        int main() {
+            volatile char *uart = (volatile char *) 0x10000000;
+            uart[0] = 'H';
+            uart[0] = 'e';
+            uart[0] = 'l';
+            uart[0] = 'l';
+            uart[0] = 'o';
+            uart[0] = ',';
+            uart[0] = ' ';
+            uart[0] = 'w';
+            uart[0] = 'o';
+            uart[0] = 'r';
+            uart[0] = 'l';
+            uart[0] = 'd';
+            uart[0] = '!';
+            uart[0] = '\n';
+            return 0;
+        }";
+        let mut file = File::create("test_helloworld.c").unwrap();
+        file.write(&c_code.as_bytes()).unwrap();
+        generate_rv_assembly("test_helloworld.c");
+        generate_rv_obj("test_helloworld.s");
+        generate_rv_binary("test_helloworld");
+    }
+
+    #[test]
+    fn compile_echoback() {
+        let c_code = r"
+        int main() {
+            while (1) {
+                volatile char *uart = (volatile char *) 0x10000000;
+                while ((uart[5] & 0x01) == 0);
+                char c = uart[0];
+                if ('a' <= c && c <= 'z') {
+                    c = c + 'A' - 'a';
+                }
+                uart[0] = c;
+            }
+        }";
+        let mut file = File::create("test_echoback.c").unwrap();
+        file.write(&c_code.as_bytes()).unwrap();
+        generate_rv_assembly("test_echoback.c");
+        generate_rv_obj("test_echoback.s");
+        generate_rv_binary("test_echoback");
     }
 }

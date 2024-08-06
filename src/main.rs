@@ -1,9 +1,12 @@
 pub mod bus;
+pub mod clint;
 pub mod cpu;
 pub mod csr;
 pub mod dram;
 pub mod exception;
 pub mod param;
+pub mod plic;
+pub mod uart;
 
 use cpu::Cpu;
 use std::io::Read;
@@ -27,7 +30,7 @@ fn main() -> io::Result<()> {
             Err(e) => {
                 cpu.handle_exception(e);
                 if e.is_fatal() {
-                    println!("{}", e);
+                    println!("error in fetch: {}", e);
                     break;
                 }
                 continue;
@@ -37,11 +40,11 @@ fn main() -> io::Result<()> {
         // decode
         // execute
         match cpu.execute(inst) {
-            Ok(n_pc) => cpu.set_pc(n_pc),
+            Ok(n_pc) => cpu.pc = n_pc,
             Err(e) => {
                 cpu.handle_exception(e);
                 if e.is_fatal() {
-                    println!("{}", e);
+                    println!("error in execute: {}", e);
                     break;
                 }
             }
