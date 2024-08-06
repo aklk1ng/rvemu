@@ -2,7 +2,6 @@
 //! block holds memory-mapped control and status registers associated with
 //! software and timer interrupts. It generates per-hart software interrupts and timer.
 
-use crate::bus::*;
 use crate::exception::*;
 use crate::param::*;
 

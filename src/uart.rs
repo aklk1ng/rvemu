@@ -85,11 +85,11 @@ impl Uart {
             UART_THR => {
                 print!("{}", value as u8 as char);
                 io::stdout().flush().unwrap();
-                return Ok(());
+                Ok(())
             }
             _ => {
                 array[index as usize] = value as u8;
-                return Ok(());
+                Ok(())
             }
         }
     }
